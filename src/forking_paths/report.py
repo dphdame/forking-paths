@@ -5,10 +5,13 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 from forking_paths.classify import DecisionCensus, extract_considered_specs
+from forking_paths.compare import ComparisonReport
 from forking_paths.flag import AbandonmentFlag
 from forking_paths.parser import Turn, hash_log, session_id_from_path
+from forking_paths.prereg import Prereg
 
 
 def _format_tool_table(counter: Counter) -> str:
@@ -33,13 +36,95 @@ def _format_flag(flag: AbandonmentFlag, idx: int) -> str:
     )
 
 
+def _format_prereg_compliance(
+    comparison: ComparisonReport,
+    prereg: Prereg,
+) -> str:
+    """Render the pre-analysis plan compliance section."""
+    lines: list[str] = []
+    lines.append("## Pre-analysis plan compliance\n")
+    lines.append(f"- **Prereg checked:** `{comparison.prereg_source or '(unknown)'}`")
+    if prereg.method:
+        lines.append(f"- **Method tag:** `{prereg.method}`")
+    lines.append(f"- **Verdict:** **{comparison.verdict}**")
+
+    if comparison.primary_spec_ran_first:
+        lines.append(
+            f"- Primary specification appears to have run first "
+            f"(detected at turn {comparison.primary_spec_detected_at_turn})."
+        )
+    elif comparison.first_regression_action_turn is not None:
+        lines.append(
+            f"- First regression-like action at turn "
+            f"{comparison.first_regression_action_turn} "
+            f"(matched on `{comparison.first_regression_action_text}`) did not "
+            "appear to be the locked primary specification."
+        )
+    else:
+        lines.append("- No regression-like actions detected in the session.")
+
+    if prereg.missing_sections:
+        lines.append(
+            f"- **Prereg sections missing:** {', '.join(prereg.missing_sections)}"
+        )
+    if prereg.unfilled_sections:
+        lines.append(
+            f"- **Prereg sections left as placeholder:** "
+            f"{', '.join(prereg.unfilled_sections)}"
+        )
+    lines.append("")
+
+    lines.append("### Deviations\n")
+    if comparison.deviations:
+        for i, dev in enumerate(comparison.deviations, 1):
+            justified = "yes" if dev.justification_provided else "no"
+            lines.append(
+                f"{i}. Turn {dev.turn_index}: {dev.what_changed} "
+                f"(justification documented: **{justified}**)"
+            )
+            if dev.justification_text:
+                lines.append(f"   - Excerpt: _{dev.justification_text}_")
+        lines.append("")
+    else:
+        lines.append("_No specification switches detected in the session._\n")
+
+    lines.append("### Ad hoc additions (in log, not in prereg)\n")
+    if comparison.ad_hoc_specs:
+        for s in comparison.ad_hoc_specs:
+            lines.append(f"- `{s}`")
+        lines.append("")
+    else:
+        lines.append("_None detected._\n")
+
+    lines.append("### Missed specifications (in prereg, not in log)\n")
+    if comparison.missed_specs:
+        for s in comparison.missed_specs:
+            lines.append(f"- {s}")
+        lines.append("")
+    else:
+        lines.append("_None detected._\n")
+
+    lines.append(
+        "_Compliance detection is heuristic. Token overlap drives the comparison; "
+        "see the limitations section below._\n"
+    )
+
+    return "\n".join(lines)
+
+
 def build_report(
     log_path: str | Path,
     turns: list[Turn],
     census: DecisionCensus,
     flags: list[AbandonmentFlag],
+    prereg: Optional[Prereg] = None,
+    comparison: Optional[ComparisonReport] = None,
 ) -> str:
-    """Build a Markdown provenance appendix."""
+    """Build a Markdown provenance appendix.
+
+    If both ``prereg`` and ``comparison`` are supplied, a pre-analysis plan
+    compliance section is inserted after the considered-specifications block.
+    """
     log_path = Path(log_path)
     sha256 = hash_log(log_path)
     session_id = session_id_from_path(log_path)
@@ -101,6 +186,9 @@ def build_report(
         parts.append("_No specifications detected by the heuristic._")
     parts.append("")
 
+    if prereg is not None and comparison is not None:
+        parts.append(_format_prereg_compliance(comparison, prereg))
+
     parts.append("## Flagged: Context-Sensitive Abandonment\n")
     if flags:
         parts.append(
@@ -130,6 +218,15 @@ def build_report(
         "- The tool reads decisions visible in the log; it does not evaluate whether the "
         "decisions were correct."
     )
+    if prereg is not None:
+        parts.append(
+            "- Pre-analysis plan compliance is determined by token overlap between "
+            "the locked specifications in `prereg.md` and the regression-like actions "
+            "in the session log. False positives occur when overlapping estimator "
+            "names appear in unrelated contexts. False negatives occur when an "
+            "estimator is named in the prereg with synonyms or acronyms not in the "
+            "matcher's keyword list."
+        )
     parts.append("")
     parts.append("---")
     parts.append(

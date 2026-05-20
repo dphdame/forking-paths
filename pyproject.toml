@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "forking-paths"
-version = "0.1.0"
+version = "0.2.0"
 description = "Provenance audit for AI-assisted empirical research. Reads a Claude Code session log and surfaces the decision graph for self-audit and referee transparency."
 readme = "README.md"
 license = { text = "MIT" }
