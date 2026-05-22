@@ -10,7 +10,7 @@ The name is from Andrew Gelman's "garden of forking paths." Every empirical anal
 
 **Gate layer.** A pre-registration template the agent commits to before running analysis. The agent must run the locked primary specification first. Any deviation requires a written methodological justification in plain text. Universal blank template lives at `guardrails/prereg.template.md`. Method-specific starters for difference-in-differences, regression discontinuity, and instrumental variables live at `guardrails/methods/`. Each method template pre-populates the procedural commitments that current canonical practice locks before estimation, with citations to the methodological literature each one draws on.
 
-**Verification layer.** The audit. Reads the Claude Code session JSONL, cross-checks against the prereg, produces a markdown provenance appendix the researcher can attach to a working paper. This is what v0.1 shipped; v0.2 extends it with the pre-analysis plan compliance section.
+**Verification layer.** The audit. Reads the Claude Code session JSONL, cross-checks against the prereg, produces a markdown provenance appendix the researcher can attach to a working paper. v0.1 shipped the audit; v0.2 extended it with the pre-analysis plan compliance section; v0.3 adds sub-estimator specification fingerprinting (see below).
 
 ## Install
 
@@ -47,6 +47,27 @@ The audit produces a markdown report containing:
 - Explicit limitations section.
 
 Attach `provenance.md` as a supplemental file to a working paper, commit it alongside your replication package, or use it for self-review before submitting. A sample is in [`examples/sample_audit_with_prereg.md`](examples/sample_audit_with_prereg.md); the v0.1-only output without the prereg-compliance section is in [`examples/sample_provenance.md`](examples/sample_provenance.md).
+
+## v0.3: sub-estimator fingerprinting
+
+v0.2 identified regression specifications by matching estimator-family keywords (TWFE, Callaway-Sant'Anna, IV, etc.) against Bash commands and assistant prose. That worked at the family level and missed sub-estimator drift: three TWFE regressions in one heredoc -- same family, different outcome / covariates / sample -- collapsed to one keyword hit. Scott Cunningham's framing of the failure mode ("the agent quietly abandons specifications that point the other way") happens at the sub-estimator level, so the family view missed it.
+
+v0.3 ships a fingerprinter (`src/forking_paths/fingerprint.py`) that parses the heredoc body of each Bash command and emits a `SpecFingerprint` per regression call:
+
+- `estimator_family`: one of `DiD-TWFE`, `DiD-CS`, `Event-Study`, `RDD-Local`, `RDD-Global`, `IV-2SLS`, `IV-LIML`, `IV-GMM`, `OLS`, `Synthetic-Control-ADH`, `Synthetic-Control-Generalized`, or `Unknown`.
+- `outcome` (dependent variable name).
+- `covariates` (tuple of column names or RHS terms).
+- `sample_restriction` (any `df = df[...]` filter applied earlier in the block).
+- `fe_structure` (e.g. `(entity, time)` for TWFE).
+- `cluster_spec` (cluster variable, "robust", or "none").
+- `functional_form` (family-specific: bandwidth/kernel for RDD, instrument list for IV, donor pool for SCM, control_group/aggregation for CS).
+- `command_hash`: stable 16-char hash of the canonicalized fingerprint, for deduplication.
+
+Family-specific parsers cover `linearmodels.PanelOLS`, `csdid.ATTgt` + `aggte`, `linearmodels.iv.IV2SLS/IVLIML/IVGMM`, `rdrobust`, `pysyncon.Synth`, `gsynth`, `statsmodels.OLS`. A Python AST fallback resolves variable-referenced covariate lists (e.g. `exog=df[model_cols]` where `model_cols` is assembled earlier in the same heredoc). When the AST cannot ground a reference (dynamic for-loops with f-string appends), the fingerprint records `covariates=("UNRESOLVED",)` rather than silently inventing column names; the audit surfaces the unresolved variable name.
+
+The audit's pre-analysis plan compliance section now includes a per-fingerprint table and treats each distinct fingerprint hash as a separate sub-estimator. A heredoc that runs three TWFE sub-specs back-to-back produces three deviation entries when only one of them is the locked primary, rather than collapsing to a single keyword match.
+
+The CLI surface and the public API of `compare_session_to_prereg(turns, prereg)` are unchanged from v0.2. The `ComparisonReport` dataclass is extended additively (`observed_fingerprints`, `primary_family`, `primary_fingerprint_hash`, `unresolved_variables`); v0.2 callers continue to read the same fields they did before.
 
 ## Available methods
 
@@ -99,7 +120,7 @@ This tool ships all three.
 .venv/bin/pytest
 ```
 
-28 tests across parser, classify, flag, report, prereg, and compare modules. All green at v0.2.0.
+61 tests across parser, classify, flag, report, prereg, compare, fingerprint, and integration modules. All green at v0.3.0.
 
 ## License
 
@@ -110,7 +131,7 @@ MIT. Use it, fork it, ship variants.
 If this tool meaningfully shapes how you report an analysis, a footnote pointing to the repo is appreciated and helps adoption.
 
 ```
-Cholette, V. (2026). forking-paths: Provenance audit for AI-assisted empirical research. v0.2.0. https://github.com/dphdame/forking-paths
+Cholette, V. (2026). forking-paths: Provenance audit for AI-assisted empirical research. v0.3.0. https://github.com/dphdame/forking-paths
 ```
 
 ## Acknowledgments
