@@ -134,7 +134,9 @@ _RDD_GLOBAL_HINT_RE = re.compile(
 
 _ATTGT_RE = re.compile(r"\bATTgt\s*\(", re.IGNORECASE)
 _AGGTE_RE = re.compile(r"\baggte\s*\(", re.IGNORECASE)
-_CSDID_RE = re.compile(r"\bcsdid\b", re.IGNORECASE)
+# csdid as a module-level call: ``csdid.ATTgt(`` / ``csdid.att_gt(`` etc.
+# Bare ``import csdid`` is not a regression action.
+_CSDID_RE = re.compile(r"\bcsdid\s*\.\s*[A-Za-z_]\w*\s*\(", re.IGNORECASE)
 
 _PANEL_OLS_RE = re.compile(r"\bPanelOLS\s*\(", re.IGNORECASE)
 _LINEARMODELS_RE = re.compile(r"\blinearmodels\b", re.IGNORECASE)
@@ -200,11 +202,13 @@ def _kwarg_regex(name: str) -> re.Pattern:
         rf"(?:df(?:_\w+)?\[\s*\[[^\]]*\]\s*\])"        # df[['a','b']]
         rf"|(?:df(?:_\w+)?\[\s*'[^']+'\s*\])"          # df['a']
         rf"|(?:df(?:_\w+)?\[\s*\"[^\"]+\"\s*\])"       # df["a"]
-        rf"|(?:[A-Za-z_]\w*)"                          # bare var name
+        rf"|(?:df(?:_\w+)?\[\s*[A-Za-z_]\w*\s*\])"     # df[model_cols]
+        rf"|(?:\[[^\[\]]*\])"                          # ['a','b']
+        rf"|(?:True|False|None)"
         rf"|(?:'[^']*')"                               # 'literal'
         rf"|(?:\"[^\"]*\")"                            # "literal"
-        rf"|(?:True|False|None)"
         rf"|(?:-?\d+\.?\d*)"
+        rf"|(?:[A-Za-z_]\w*)"                          # bare var name (last)
         rf")",
         re.DOTALL,
     )
@@ -246,7 +250,19 @@ def _extract_list_from_kwarg(body: str, name: str) -> tuple:
     raw = _extract_kwarg(body, name)
     if not raw:
         return ()
-    # df[['x','y']] form
+    # df[var] form where var is a bare identifier (not a string literal /
+    # list literal).
+    m = re.match(r"df(?:_\w+)?\[\s*([A-Za-z_]\w*)\s*\]", raw)
+    if m:
+        var_name = m.group(1)
+        resolved = _ast_resolve_variable(body, var_name)
+        if resolved:
+            return tuple(resolved)
+        logger.info(
+            "Unresolved variable reference for kwarg %s: df[%s]", name, var_name
+        )
+        return ("UNRESOLVED",)
+    # df[['x','y']] / df['x'] form
     if raw.startswith("df"):
         flat = _strip_df_index(raw)
         if flat:
@@ -293,65 +309,125 @@ def _ast_resolve_variable(body: str, var_name: str) -> Optional[list]:
     assignments: dict[str, list] = {}
     append_calls: dict[str, list] = {}
 
-    def _literal(node) -> Optional[list]:
-        if isinstance(node, ast.List):
-            out = []
-            for el in node.elts:
-                if isinstance(el, ast.Constant) and isinstance(el.value, str):
-                    out.append(el.value)
-                else:
-                    return None
-            return out
-        if isinstance(node, ast.Name) and node.id in assignments:
-            return list(assignments[node.id])
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-            left = _literal(node.left)
-            right = _literal(node.right)
-            if left is not None and right is not None:
-                return left + right
+    # First pass: walk statements in source order, collecting both
+    # assignments and append calls. We resolve Name references at the
+    # end against the merged map; this lets `model_cols = event_cols`
+    # see the appends to event_cols even when the append statements
+    # appear before the assignment in source order.
+
+    # Top-level body statements (don't descend into for/if branches; the
+    # AST walker would otherwise re-visit nested expressions out of order
+    # and lose source-order context).
+    def _walk(stmts):
+        for stmt in stmts:
+            if isinstance(stmt, ast.Assign):
+                for tgt in stmt.targets:
+                    if isinstance(tgt, ast.Name):
+                        if isinstance(stmt.value, ast.List):
+                            lit = _literal_from_list(stmt.value)
+                            if lit is not None:
+                                assignments[tgt.id] = lit
+                            else:
+                                assignments[tgt.id] = ["UNRESOLVED"]
+                        else:
+                            # Store a pointer to the AST node to resolve later.
+                            assignments[tgt.id] = stmt.value
+            elif isinstance(stmt, ast.AugAssign):
+                if isinstance(stmt.target, ast.Name):
+                    base = assignments.get(stmt.target.id)
+                    new = _literal_from_list(stmt.value) if isinstance(stmt.value, ast.List) else None
+                    if isinstance(base, list) and new is not None:
+                        assignments[stmt.target.id] = base + new
+            elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+                call = stmt.value
+                if (
+                    isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "append"
+                    and isinstance(call.func.value, ast.Name)
+                    and call.args
+                ):
+                    varname = call.func.value.id
+                    arg = call.args[0]
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        append_calls.setdefault(varname, []).append(arg.value)
+                    else:
+                        append_calls.setdefault(varname, []).append("UNRESOLVED")
+            elif isinstance(stmt, (ast.For, ast.If, ast.While)):
+                # For dynamic constructs we don't try to unroll; instead
+                # we mark any append target inside as UNRESOLVED so the
+                # outer resolution propagates that signal.
+                for substmt in ast.walk(stmt):
+                    if isinstance(substmt, ast.Expr) and isinstance(substmt.value, ast.Call):
+                        c = substmt.value
+                        if (
+                            isinstance(c.func, ast.Attribute)
+                            and c.func.attr == "append"
+                            and isinstance(c.func.value, ast.Name)
+                        ):
+                            varname = c.func.value.id
+                            append_calls.setdefault(varname, []).append("UNRESOLVED")
+
+    _walk(tree.body)
+
+    # Merge append_calls into assignments to produce final lists.
+    final: dict[str, list] = {}
+
+    def _resolve(name: str, depth: int = 0) -> Optional[list]:
+        if depth > 10:
             return None
+        if name in final:
+            return final[name]
+        base = assignments.get(name)
+        items: list = []
+        if isinstance(base, list):
+            for el in base:
+                items.append(el)
+        elif isinstance(base, ast.AST):
+            # Resolve via the AST node.
+            lit = _resolve_ast_value(base, _resolve, depth + 1)
+            if lit is None:
+                items.append("UNRESOLVED")
+            else:
+                items.extend(lit)
+        # Add any appends recorded for this name (in append order).
+        for el in append_calls.get(name, []):
+            items.append(el)
+        final[name] = items
+        return items
+
+    resolved = _resolve(var_name)
+    if resolved is None:
         return None
+    if any(x == "UNRESOLVED" for x in resolved):
+        return ["UNRESOLVED"]
+    return resolved
 
-    for stmt in ast.walk(tree):
-        if isinstance(stmt, ast.Assign):
-            value_lit = _literal(stmt.value)
-            for tgt in stmt.targets:
-                if isinstance(tgt, ast.Name) and value_lit is not None:
-                    assignments[tgt.id] = value_lit
-        elif isinstance(stmt, ast.AugAssign):
-            if isinstance(stmt.target, ast.Name):
-                value_lit = _literal(stmt.value)
-                if value_lit is not None:
-                    assignments.setdefault(stmt.target.id, []).extend(value_lit)
-        elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
-            call = stmt.value
-            # Catch x.append('...') / x.append(some_var)
-            if (
-                isinstance(call.func, ast.Attribute)
-                and call.func.attr == "append"
-                and isinstance(call.func.value, ast.Name)
-                and call.args
-            ):
-                varname = call.func.value.id
-                arg = call.args[0]
-                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                    append_calls.setdefault(varname, []).append(arg.value)
-                # Track that some appends happen even if value is dynamic.
-                else:
-                    append_calls.setdefault(varname, []).append("UNRESOLVED")
 
-    # Merge appends into assignments (append_calls may also be the sole
-    # source if the variable was initialized to [] then appended to).
-    for k, items in append_calls.items():
-        base = assignments.get(k, [])
-        assignments[k] = base + items
+def _literal_from_list(node) -> Optional[list]:
+    """Return the list-of-strings for an ast.List literal, or None."""
+    if not isinstance(node, ast.List):
+        return None
+    out = []
+    for el in node.elts:
+        if isinstance(el, ast.Constant) and isinstance(el.value, str):
+            out.append(el.value)
+        else:
+            return None
+    return out
 
-    if var_name in assignments:
-        resolved = assignments[var_name]
-        # If anything inside is UNRESOLVED, propagate that signal.
-        if any(x == "UNRESOLVED" for x in resolved):
-            return ["UNRESOLVED"]
-        return resolved
+
+def _resolve_ast_value(node, resolve_fn, depth: int) -> Optional[list]:
+    """Resolve an AST RHS value against the resolve_fn for Name references."""
+    if isinstance(node, ast.List):
+        return _literal_from_list(node)
+    if isinstance(node, ast.Name):
+        return resolve_fn(node.id, depth)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _resolve_ast_value(node.left, resolve_fn, depth + 1)
+        right = _resolve_ast_value(node.right, resolve_fn, depth + 1)
+        if left is not None and right is not None:
+            return left + right
+        return None
     return None
 
 
@@ -631,6 +707,13 @@ def _looks_like_regression(body: str) -> bool:
         "synth(",
         "gsynth(",
         "attgt",
+        # Common bare tokens in Rscript-style filenames or one-line calls.
+        "twfe",
+        "event_study",
+        "event-study",
+        "callaway",
+        "santanna",
+        "did",
     )
     low = body.lower()
     return any(h in low for h in hints)

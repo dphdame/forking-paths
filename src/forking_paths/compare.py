@@ -363,36 +363,41 @@ def compare_session_to_prereg(
                     )
 
         is_reg, descriptor = _is_regression_action(turn)
+        # Treat the fingerprint layer as authoritative only when it can
+        # actually identify a family. All-"Unknown" fingerprints (e.g.
+        # ``Rscript twfe_primary.R`` -- no heredoc to inspect) fall back
+        # to the keyword-token matcher so v0.2-style fixtures still work.
+        actionable_fps = [fp for fp in fingerprints if fp.estimator_family != "Unknown"]
+
         if is_reg and report.first_regression_action_turn is None:
             report.first_regression_action_turn = turn.index
             report.first_regression_action_text = descriptor
             # Prefer fingerprint-family check; fall back to keyword tokens.
-            if fingerprints and primary_families:
-                if any(fp.estimator_family in primary_families for fp in fingerprints):
+            if actionable_fps and primary_families:
+                if any(fp.estimator_family in primary_families for fp in actionable_fps):
                     primary_seen_first = True
                     primary_seen_at = turn.index
-                    # Record the matching fingerprint's hash.
-                    for fp in fingerprints:
+                    for fp in actionable_fps:
                         if fp.estimator_family in primary_families:
                             report.primary_fingerprint_hash = fp.command_hash
                             break
-            elif primary_tokens:
-                turn_tokens = _spec_tokens(_turn_text_blob(turn))
-                if primary_tokens & turn_tokens:
-                    primary_seen_first = True
-                    primary_seen_at = turn.index
+            else:
+                # Keyword path: matches both for Rscript fixtures and the
+                # v0.2-compatible mixed case where fingerprint returns Unknown.
+                if primary_tokens:
+                    turn_tokens = _spec_tokens(_turn_text_blob(turn))
+                    if primary_tokens & turn_tokens:
+                        primary_seen_first = True
+                        primary_seen_at = turn.index
 
         if is_reg:
             observed_tokens |= _spec_tokens(_turn_text_blob(turn))
 
         if _is_switch(turn):
             has_just, just_snippet = _has_justification(turn)
-            # Build the "what changed" descriptor. Prefer the fingerprint
-            # of the regression call in this turn (if any); fall back to
-            # the keyword-token set on the prose blob.
             switch_descriptor = descriptor or "specification switch"
-            if fingerprints:
-                fp = fingerprints[0]
+            if actionable_fps:
+                fp = actionable_fps[0]
                 switch_descriptor = f"switched to: {_fp_short(fp)}"
                 report.deviations.append(
                     Deviation(
@@ -422,34 +427,32 @@ def compare_session_to_prereg(
     # observed fingerprint whose hash differs from the locked primary's
     # is a candidate deviation. This is the v0.3-distinct behavior --
     # v0.2 treated three TWFE sub-specs as one drift; v0.3 treats them
-    # as three.
-    if report.observed_fingerprints and primary_families:
+    # as three. Skip Unknown-family fingerprints; those flow through the
+    # keyword-token path so v0.2-style fixtures behave as before.
+    actionable_all = [
+        fp for fp in report.observed_fingerprints
+        if fp.estimator_family != "Unknown"
+    ]
+    if actionable_all and primary_families:
         primary_hash = report.primary_fingerprint_hash
         seen_hashes: set[str] = set()
-        # First, find the locked primary fingerprint to anchor on.
-        for fp in report.observed_fingerprints:
+        for fp in actionable_all:
             if not primary_hash and fp.estimator_family in primary_families:
                 primary_hash = fp.command_hash
                 report.primary_fingerprint_hash = primary_hash
                 break
-        # Now record additional fingerprints as deviations if their hash
-        # differs from primary AND we haven't already logged this hash
-        # through the switch-keyword path above.
         already_logged: set[str] = {
             d.fingerprint.command_hash
             for d in report.deviations
             if d.fingerprint is not None
         }
-        for fp in report.observed_fingerprints:
+        for fp in actionable_all:
             if fp.command_hash == primary_hash:
                 seen_hashes.add(fp.command_hash)
                 continue
             if fp.command_hash in already_logged or fp.command_hash in seen_hashes:
                 continue
-            # Locate the turn index of this fingerprint.
             turn_idx = _find_turn_for_fingerprint(turns, fp)
-            # Justification check: look at this turn for any of the
-            # JUSTIFICATION_KEYWORDS.
             turn_obj = turns[turn_idx] if 0 <= turn_idx < len(turns) else None
             if turn_obj is not None:
                 has_just, just_snippet = _has_justification(turn_obj)
@@ -471,20 +474,22 @@ def compare_session_to_prereg(
     report.unresolved_variables = unresolved
 
     # Ad hoc additions: observed families/tokens not in any locked spec.
-    ad_hoc_families = sorted(observed_families - locked_all_families - {"Unknown"})
+    actionable_families = observed_families - {"Unknown"}
+    ad_hoc_families = sorted(actionable_families - locked_all_families)
     ad_hoc_keyword = sorted(observed_tokens - locked_all_tokens) if locked_all_tokens else []
-    # Preserve v0.2 behavior on keyword-only fixtures (report tokens); when
-    # fingerprints are available, prefer family labels.
-    if report.observed_fingerprints:
+    # When the fingerprint layer identified a real family for at least one
+    # spec, use families. When everything came through as Unknown (i.e. the
+    # v0.2-era Rscript-style fixtures), report keyword tokens.
+    if actionable_families:
         report.ad_hoc_specs = ad_hoc_families
     else:
         report.ad_hoc_specs = ad_hoc_keyword
 
     # Missed specs: locked ladder entries (and primary) whose families
     # never showed up in observed_families. Falls back to tokens when no
-    # fingerprints are available.
+    # actionable fingerprints are available.
     missed: list[str] = []
-    if report.observed_fingerprints:
+    if actionable_families:
         if primary_families and not (primary_families & observed_families):
             missed.append(
                 f"primary specification: {prereg.primary_specification[:80]}"
