@@ -36,6 +36,29 @@ def _format_flag(flag: AbandonmentFlag, idx: int) -> str:
     )
 
 
+def _format_fingerprint_table(comparison: ComparisonReport) -> str:
+    """Render a per-fingerprint table for the v0.3 audit section."""
+    fps = comparison.observed_fingerprints
+    if not fps:
+        return "_no regression specifications detected by the fingerprint layer_"
+    rows = [
+        "| # | Family | Outcome | Covariates | FE | Cluster | Sample restr. | Hash |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for i, fp in enumerate(fps, 1):
+        cov = ", ".join(fp.covariates[:4]) if fp.covariates else "_(none)_"
+        if fp.covariates and len(fp.covariates) > 4:
+            cov += ", ..."
+        fe = "+".join(fp.fe_structure) if fp.fe_structure else "_(none)_"
+        clust = fp.cluster_spec or "none"
+        samp = (fp.sample_restriction or "_(full)_")[:40]
+        rows.append(
+            f"| {i} | `{fp.estimator_family}` | `{fp.outcome or '?'}` | "
+            f"{cov} | {fe} | {clust} | {samp} | `{fp.command_hash}` |"
+        )
+    return "\n".join(rows)
+
+
 def _format_prereg_compliance(
     comparison: ComparisonReport,
     prereg: Prereg,
@@ -46,6 +69,8 @@ def _format_prereg_compliance(
     lines.append(f"- **Prereg checked:** `{comparison.prereg_source or '(unknown)'}`")
     if prereg.method:
         lines.append(f"- **Method tag:** `{prereg.method}`")
+    if comparison.primary_family:
+        lines.append(f"- **Primary estimator family (inferred):** `{comparison.primary_family}`")
     lines.append(f"- **Verdict:** **{comparison.verdict}**")
 
     if comparison.primary_spec_ran_first:
@@ -104,9 +129,25 @@ def _format_prereg_compliance(
     else:
         lines.append("_None detected._\n")
 
+    lines.append("### Observed sub-estimator fingerprints (v0.3)\n")
+    lines.append(_format_fingerprint_table(comparison))
+    lines.append("")
+
+    if comparison.unresolved_variables:
+        lines.append("### Fingerprinter notes\n")
+        lines.append(
+            "_The AST fallback could not ground the following variable "
+            "references; covariates list shown as `UNRESOLVED`._\n"
+        )
+        for note in comparison.unresolved_variables[:20]:
+            lines.append(f"- {note}")
+        lines.append("")
+
     lines.append(
-        "_Compliance detection is heuristic. Token overlap drives the comparison; "
-        "see the limitations section below._\n"
+        "_Compliance detection is heuristic. Fingerprint hashes are computed "
+        "over canonicalized (family, outcome, covariates, FE, cluster, sample) "
+        "tuples; two specifications with the same hash are treated as the same "
+        "sub-estimator. See the limitations section below._\n"
     )
 
     return "\n".join(lines)

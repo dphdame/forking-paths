@@ -6,12 +6,17 @@ from forking_paths.compare import (
     Deviation,
     compare_session_to_prereg,
 )
+from forking_paths.fingerprint import (
+    SpecFingerprint,
+    fingerprint_command,
+    detect_family,
+)
 from forking_paths.flag import AbandonmentFlag, flag_context_sensitive_abandonment
 from forking_paths.parser import Turn, parse_session
 from forking_paths.prereg import Prereg, parse_prereg
 from forking_paths.report import build_report
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "Turn",
@@ -26,4 +31,7 @@ __all__ = [
     "ComparisonReport",
     "Deviation",
     "compare_session_to_prereg",
+    "SpecFingerprint",
+    "fingerprint_command",
+    "detect_family",
 ]
