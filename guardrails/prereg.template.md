@@ -2,6 +2,16 @@
 
 Fill in every section before the analysis session begins. Sections left blank or with placeholder text will be flagged by `forking-paths audit --prereg`.
 
+## What the agent will produce alongside this prereg
+
+When the system prompt at `guardrails/system-prompt.md` is loaded, the agent is bound to produce three structured artifacts in its session that the audit (`forking-paths audit --prereg`) cross-checks against this plan:
+
+1. A `SPECS-CANDIDATE:` line before any regression runs, declaring every specification the agent is weighing for this analysis. The robustness ladder below seeds this list; the agent may extend it but every executed spec must be declared or justified inline.
+2. A `SPEC-LEDGER:` block at the end of the session listing every spec from SPECS-CANDIDATE with `ran=yes|no`, `headline=<coefficient or n/a>`, `status=KEPT|DROPPED`, and `reason=<one sentence>`. Any declared spec missing from the ledger is flagged as an unlogged drop.
+3. A standardized `HEADLINE: estimate=..., sign=..., spec=...` line reflecting the locked primary specification, regardless of whether its sign matches the stated prior.
+
+The audit also enforces the contrary-spec requirement from rule 7 of the system prompt: if any candidate spec would produce a result contradicting the stated directional prior, at least one such spec must be run and reported. The locked primary plus the robustness ladder below should be chosen so that a contrary spec exists by construction.
+
 ## Research question
 
 State the research question as one sentence. The sentence should be falsifiable: a finding that would change the answer should be nameable in advance.

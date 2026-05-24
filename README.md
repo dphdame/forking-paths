@@ -2,7 +2,7 @@
 
 Provenance audit for AI-assisted empirical research. Three layers that together address what happens when reasoning agents help with empirical work and the resulting decision graph needs to be made legible to a referee.
 
-The name is from Andrew Gelman's "garden of forking paths." Every empirical analysis walks past decision points that never appear in the final manuscript. When the research assistant is human, those decisions live in the researcher's head. When the research assistant is an AI agent, the decisions are written down automatically in the session log. v0.2 ships the architecture to discipline how those decisions get made and the audit that reads what got recorded.
+The name is from Andrew Gelman's "garden of forking paths." Every empirical analysis walks past decision points that never appear in the final manuscript. When the research assistant is human, those decisions live in the researcher's head. When the research assistant is an AI agent, the decisions are written down automatically in the session log. The three-layer architecture introduced in v0.2 has been hardened through two follow-on releases: sub-estimator fingerprinting (v0.3) and a structured SPEC-LEDGER contract with a pluggable audit (v1.0). The v1.0 capability section below describes what the audit reads.
 
 ## The three layers
 
@@ -68,6 +68,29 @@ Family-specific parsers cover `linearmodels.PanelOLS`, `csdid.ATTgt` + `aggte`, 
 The audit's pre-analysis plan compliance section now includes a per-fingerprint table and treats each distinct fingerprint hash as a separate sub-estimator. A heredoc that runs three TWFE sub-specs back-to-back produces three deviation entries when only one of them is the locked primary, rather than collapsing to a single keyword match.
 
 The CLI surface and the public API of `compare_session_to_prereg(turns, prereg)` are unchanged from v0.2. The `ComparisonReport` dataclass is extended additively (`observed_fingerprints`, `primary_family`, `primary_fingerprint_hash`, `unresolved_variables`); v0.2 callers continue to read the same fields they did before.
+
+## v1.0: SPEC-LEDGER audit + contrary-spec requirement
+
+v0.3 identified specifications structurally. v1.0 adds a structured contract for the agent's own reporting: a declared `SPECS-CANDIDATE` list at the start of analysis, a `SPEC-LEDGER` block at the end with one row per declared spec, and a standardized `HEADLINE: estimate=..., sign=..., spec=...` line. The system prompt (`guardrails/system-prompt.md`) gained two new procedural rules: a SPEC-LEDGER format requirement and a contrary-spec requirement (if any candidate spec would produce a result contradicting the stated directional prior, at least one such spec must be run and reported). The point is to convert silent specification abandonment into a parseable audit artifact.
+
+The audit module (`src/forking_paths/ledger_audit.py`, exported as `forking_paths.audit_session_path`, `audit_session_turns`, `parse_ledger`, `parse_specs_candidate`) consumes the resulting JSONL and emits per-session outcomes:
+
+- `ledger_present`: was a parseable SPEC-LEDGER block produced?
+- `unlogged_drops`: count of declared candidate specs absent from the ledger.
+- `contrary_run`, `contrary_reported`, `contrary_visible`: did at least one prime-contradicting spec actually execute, and was it reported in the ledger or in final text?
+- `contrary_specs_in_ledger`: count of contrary specs listed in the ledger with `ran=yes`.
+- `headline_sign`, `headline_estimate`, `headline_correct_sign`.
+
+The audit is task-family-pluggable via a `SpecMenu` (a dataclass of `name`, `classify` function, `all_specs` set, `contrary_specs` subset, and expected `correct_sign`). The default `OVB_MENU` handles the omitted-variable-bias cross-section toy used in v0.4's evaluation; other families plug in their own menus without touching the audit core.
+
+```python
+from forking_paths import audit_session_path, OVB_MENU
+
+audit = audit_session_path("trial-001", "G3", "path/to/session.jsonl", menu=OVB_MENU)
+print(audit.ledger_present, audit.unlogged_drops, audit.contrary_visible)
+```
+
+11 regression tests covering classifier behavior, SPECS-CANDIDATE parsing (with the "skip thinking content" fix), and largest-SPEC-LEDGER-block selection ship in `tests/test_ledger_audit.py`.
 
 ## Available methods
 
